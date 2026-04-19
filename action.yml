@@ -1,0 +1,16 @@
+name: AI Code Reviewer
+description: Automatically reviews pull requests using Groq AI (llama-3.3-70b-versatile)
+author: krishthesmart
+
+inputs:
+  groq_api_key:
+    description: Your Groq API key (get one free at console.groq.com)
+    required: true
+
+branding:
+  icon: eye
+  color: purple
+
+runs:
+  using: node20
+  main: dist/index.js

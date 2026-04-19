@@ -4,11 +4,10 @@
   "description": "AI-powered GitHub Action that reviews pull requests using Groq API",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "lint": "eslint src/"
+    "start": "node src/index.js"
   },
   "dependencies": {
-    "@octokit/rest": "^20.1.1",ds
+    "@octokit/rest": "^20.1.1",
     "groq-sdk": "^0.7.0"
   },
   "engines": {
@@ -16,6 +15,3 @@
   },
   "license": "MIT"
 }
- 
- 
- 

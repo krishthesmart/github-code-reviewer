@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p \"/Users/arulmeiyappan/ai /github code reviewer/ai-code-reviewer/src\")",
+      "Bash(mkdir -p \"/Users/arulmeiyappan/ai /github code reviewer/ai-code-reviewer/.github/workflows\")"
+    ]
+  }
+}

@@ -1,5 +1,6 @@
 const { Octokit } = require("@octokit/rest");
 const Groq = require("groq-sdk");
+const core = require("@actions/core");
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -85,7 +86,7 @@ async function postComment(octokit, { owner, repo, prNumber, body }) {
 
 async function run() {
   // ── Environment ────────────────────────────────────────────────────────────
-  const groqApiKey   = getEnv("GROQ_API_KEY");
+  const groqApiKey   = core.getInput("groq_api_key", { required: true });
   const githubToken  = getEnv("GITHUB_TOKEN");
   const githubRepo   = getEnv("GITHUB_REPOSITORY");        // "owner/repo"
   const eventPath    = getEnv("GITHUB_EVENT_PATH");

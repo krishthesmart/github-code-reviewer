@@ -8,7 +8,7 @@
     "lint": "eslint src/"
   },
   "dependencies": {
-    "@octokit/rest": "^20.1.1",
+    "@octokit/rest": "^20.1.1",ds
     "groq-sdk": "^0.7.0"
   },
   "engines": {

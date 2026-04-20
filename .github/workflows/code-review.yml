@@ -5,8 +5,9 @@ on:
     types: [opened, synchronize]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
+  issues: write
 
 jobs:
   ai-review:
@@ -22,3 +23,4 @@ jobs:
         with:
           groq_api_key: ${{ secrets.GROQ_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          auto_fix: "true"

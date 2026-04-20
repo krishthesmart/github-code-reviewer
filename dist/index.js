@@ -41126,6 +41126,7 @@ async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
   });
 
   console.log(`\n✅  Review posted — ${finalVerdict} · ${allIssues.length} issue(s) · ${inlineComments.length} inline comment(s)`);
+  return finalVerdict;
 }
 
 // ── Fix mode ──────────────────────────────────────────────────────────────────
@@ -41314,6 +41315,7 @@ async function main() {
   const groqApiKey  = core.getInput("groq_api_key", { required: true });
   const githubToken = core.getInput("github_token", { required: true });
   const mode        = core.getInput("mode") || "review";
+  const autoFix     = core.getInput("auto_fix") === "true";
   const githubRepo  = getEnv("GITHUB_REPOSITORY");
   const eventPath   = getEnv("GITHUB_EVENT_PATH");
 
@@ -41343,11 +41345,16 @@ async function main() {
     console.log(`\n🔍  Reviewing PR #${prNumber} in ${owner}/${repo}\n`);
     await runReview(octokit, groq, { owner, repo, prNumber, commitId });
   } else {
+    // pull_request event
     const prNumber = event.pull_request?.number;
     const commitId = event.pull_request?.head?.sha;
     if (!prNumber) throw new Error("Could not determine PR number from event payload.");
     console.log(`\n🔍  Reviewing PR #${prNumber} in ${owner}/${repo}\n`);
-    await runReview(octokit, groq, { owner, repo, prNumber, commitId });
+    const verdict = await runReview(octokit, groq, { owner, repo, prNumber, commitId });
+    if (autoFix && verdict === "REQUEST_CHANGES") {
+      console.log(`\n🔧  Auto-fix enabled — fixing PR #${prNumber} automatically\n`);
+      await runFix(octokit, groq, { owner, repo, prNumber, commentId: null });
+    }
   }
 }
 

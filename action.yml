@@ -13,6 +13,10 @@ inputs:
     description: "review (default) or fix"
     required: false
     default: review
+  auto_fix:
+    description: "Automatically create a fix PR when issues are found (true/false)"
+    required: false
+    default: "false"
 
 branding:
   icon: eye

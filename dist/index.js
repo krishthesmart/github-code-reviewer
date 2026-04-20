@@ -40991,7 +40991,8 @@ async function postReview(octokit, { owner, repo, prNumber, body, verdict, commi
       comments: inlineComments,
     });
   } catch (err) {
-    if (err.message?.includes("own pull request")) {
+    const ghMsg = err.response?.data?.message || err.message || "";
+    if (ghMsg.toLowerCase().includes("own pull request") || (err.status === 422 && ghMsg.toLowerCase().includes("can not request changes"))) {
       await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
     } else {
       throw err;
@@ -41001,6 +41002,9 @@ async function postReview(octokit, { owner, repo, prNumber, body, verdict, commi
 
 async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
   await dismissStaleReviews(octokit, { owner, repo, prNumber });
+
+  const { data: prInfo } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
+  const isBotOwnPr = prInfo.user?.type === "Bot";
 
   const { data: files } = await octokit.rest.pulls.listFiles({
     owner, repo, pull_number: prNumber, per_page: 100,
@@ -41042,7 +41046,8 @@ async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
     }
   }
 
-  const finalVerdict = overallVerdict(results);
+  let finalVerdict = overallVerdict(results);
+  if (isBotOwnPr && finalVerdict === "REQUEST_CHANGES") finalVerdict = "COMMENT";
 
   // ── Build inline comments ────────────────────────────────────────────────
   const inlineComments = [];

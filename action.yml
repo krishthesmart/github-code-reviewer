@@ -6,6 +6,9 @@ inputs:
   groq_api_key:
     description: Your Groq API key (get one free at console.groq.com)
     required: true
+  github_token:
+    description: GitHub token for posting reviews (use secrets.GITHUB_TOKEN)
+    required: true
 
 branding:
   icon: eye

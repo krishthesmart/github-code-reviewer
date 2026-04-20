@@ -41045,7 +41045,18 @@ function validateSyntax(content, filename) {
 
 // ── Fix mode ──────────────────────────────────────────────────────────────────
 
+function postProcessCode(content) {
+  // Fix most common AI mistake: res.send(<html>) → res.send(`<html>`)
+  return content.replace(
+    /(\.\w+\s*\()\s*(<[^)]{0,500}>)\s*\)/g,
+    (_, call, html) => `${call}\`${html}\`)`
+  );
+}
+
 async function fixFileWithAI(groq, filename, content, feedback, priorSyntaxError = null) {
+  const ext = path.extname(filename).toLowerCase();
+  const isJS = [".js", ".mjs", ".cjs", ".ts", ".tsx"].includes(ext);
+
   let userMessage = `Fix ALL the issues listed below in this file.
 
 File: ${filename}
@@ -41057,11 +41068,17 @@ ${truncate(content, MAX_FILE_CHARS)}
 
 Issues to fix:
 ${feedback}
-
+${isJS ? `
+CRITICAL JAVASCRIPT SYNTAX RULES — violating these causes a SyntaxError:
+- NEVER use JSX syntax. This is plain JavaScript, not React.
+- To send HTML in Express: use a template literal → res.send(\`<h1>Hello \${name}</h1>\`)
+- NEVER write: res.send(<h1>Hello \${name}</h1>) — angle brackets are NOT valid here
+- String concatenation is also valid: res.send('<h1>Hello ' + name + '</h1>')
+` : ""}
 Return ONLY the complete fixed file content. No explanations, no markdown code fences, no extra text.`;
 
   if (priorSyntaxError) {
-    userMessage += `\n\nWARNING: Your previous attempt produced invalid syntax:\n${priorSyntaxError}\nFix the syntax error too. Remember to use backticks for template literals in JS, not HTML tags directly in function calls.`;
+    userMessage += `\n\nYour previous attempt had this syntax error:\n${priorSyntaxError}\nDo NOT repeat the same mistake.`;
   }
 
   const completion = await groq.chat.completions.create({
@@ -41150,7 +41167,9 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
       });
 
       const original = Buffer.from(fileData.content, "base64").toString("utf8");
-      let fixedContent = await fixFileWithAI(groq, file.filename, original, feedback);
+      let fixedContent = postProcessCode(
+        await fixFileWithAI(groq, file.filename, original, feedback)
+      );
 
       if (!fixedContent || fixedContent === original) {
         console.log(`    No changes needed for ${file.filename}`);
@@ -41160,7 +41179,9 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
       let check = validateSyntax(fixedContent, file.filename);
       if (!check.valid) {
         console.log(`    ↻ Syntax error — retrying with error feedback...`);
-        fixedContent = await fixFileWithAI(groq, file.filename, original, feedback, check.error);
+        fixedContent = postProcessCode(
+          await fixFileWithAI(groq, file.filename, original, feedback, check.error)
+        );
         check = validateSyntax(fixedContent, file.filename);
       }
 

@@ -35596,21 +35596,6 @@ module.exports = eval("require")("encoding");
 
 /***/ }),
 
-/***/ 6589:
-/***/ ((module) => {
-
-function webpackEmptyContext(req) {
-	var e = new Error("Cannot find module '" + req + "'");
-	e.code = 'MODULE_NOT_FOUND';
-	throw e;
-}
-webpackEmptyContext.keys = () => ([]);
-webpackEmptyContext.resolve = webpackEmptyContext;
-webpackEmptyContext.id = 6589;
-module.exports = webpackEmptyContext;
-
-/***/ }),
-
 /***/ 2613:
 /***/ ((module) => {
 
@@ -40798,11 +40783,6 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],"disallowed_STD3_valid"],[[45
 /******/ 	}
 /******/ 	
 /************************************************************************/
-/******/ 	/* webpack/runtime/hasOwnProperty shorthand */
-/******/ 	(() => {
-/******/ 		__nccwpck_require__.o = (obj, prop) => (Object.prototype.hasOwnProperty.call(obj, prop))
-/******/ 	})();
-/******/ 	
 /******/ 	/* webpack/runtime/compat */
 /******/ 	
 /******/ 	if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = __dirname + "/";
@@ -40812,6 +40792,7 @@ var __webpack_exports__ = {};
 const { Octokit } = __nccwpck_require__(5772);
 const Groq = __nccwpck_require__(4105);
 const core = __nccwpck_require__(7484);
+const fs = __nccwpck_require__(9896);
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -40970,7 +40951,7 @@ async function run() {
 
   const [owner, repo] = githubRepo.split("/");
 
-  const event    = __nccwpck_require__(6589)(eventPath);
+  const event    = JSON.parse(fs.readFileSync(eventPath, "utf8"));
   const prNumber = event.pull_request?.number;
   const commitId = event.pull_request?.head?.sha;
   if (!prNumber) throw new Error("Could not determine PR number from event payload.");

@@ -1,6 +1,7 @@
 const { Octokit } = require("@octokit/rest");
 const Groq = require("groq-sdk");
 const core = require("@actions/core");
+const fs = require("fs");
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -159,7 +160,7 @@ async function run() {
 
   const [owner, repo] = githubRepo.split("/");
 
-  const event    = require(eventPath);
+  const event    = JSON.parse(fs.readFileSync(eventPath, "utf8"));
   const prNumber = event.pull_request?.number;
   const commitId = event.pull_request?.head?.sha;
   if (!prNumber) throw new Error("Could not determine PR number from event payload.");

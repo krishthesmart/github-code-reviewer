@@ -21,3 +21,4 @@ jobs:
         uses: krishthesmart/github-code-reviewer@v1
         with:
           groq_api_key: ${{ secrets.GROQ_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}

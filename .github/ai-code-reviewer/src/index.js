@@ -153,7 +153,7 @@ async function postReview(octokit, { owner, repo, prNumber, body, verdict, commi
 
 async function run() {
   const groqApiKey  = core.getInput("groq_api_key", { required: true });
-  const githubToken = getEnv("GITHUB_TOKEN");
+  const githubToken = core.getInput("github_token", { required: true });
   const githubRepo  = getEnv("GITHUB_REPOSITORY");
   const eventPath   = getEnv("GITHUB_EVENT_PATH");
 

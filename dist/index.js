@@ -40804,7 +40804,7 @@ const SKIP_EXTENSIONS = new Set([
   "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
 ]);
 
-const SYSTEM_PROMPT = `You are a senior security-focused code reviewer. Analyze the provided diff thoroughly.
+const REVIEW_SYSTEM_PROMPT = `You are a senior security-focused code reviewer. Analyze the provided diff thoroughly.
 
 For every issue found, use EXACTLY this format:
 **[SEVERITY] Category — Description**
@@ -40867,6 +40867,7 @@ If the diff is clean, say so briefly and use VERDICT: APPROVE.
 Do not repeat the diff. Be specific and actionable.`;
 
 const MAX_DIFF_CHARS = 15_000;
+const MAX_FILE_CHARS = 20_000;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -40885,12 +40886,9 @@ function shouldSkip(file) {
   return false;
 }
 
-function truncateDiff(patch) {
-  if (patch.length <= MAX_DIFF_CHARS) return patch;
-  return (
-    patch.slice(0, MAX_DIFF_CHARS) +
-    `\n\n[...diff truncated at ${MAX_DIFF_CHARS} chars...]`
-  );
+function truncate(str, max) {
+  if (str.length <= max) return str;
+  return str.slice(0, max) + `\n\n[...truncated at ${max} chars...]`;
 }
 
 function parseVerdict(feedback) {
@@ -40914,15 +40912,19 @@ function verdictEmoji(verdict) {
   return "💬 COMMENTED";
 }
 
-// ── Core ─────────────────────────────────────────────────────────────────────
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// ── Review mode ───────────────────────────────────────────────────────────────
 
 async function reviewFile(groq, filename, patch) {
-  const userMessage = `File: ${filename}\n\n\`\`\`diff\n${truncateDiff(patch)}\n\`\`\``;
+  const userMessage = `File: ${filename}\n\n\`\`\`diff\n${truncate(patch, MAX_DIFF_CHARS)}\n\`\`\``;
 
   const completion = await groq.chat.completions.create({
     model: GROQ_MODEL,
     messages: [
-      { role: "system", content: SYSTEM_PROMPT },
+      { role: "system", content: REVIEW_SYSTEM_PROMPT },
       { role: "user", content: userMessage },
     ],
     temperature: 0.1,
@@ -40939,33 +40941,13 @@ async function postReview(octokit, { owner, repo, prNumber, body, verdict, commi
     pull_number: prNumber,
     commit_id: commitId,
     body,
-    event: verdict, // APPROVE | REQUEST_CHANGES | COMMENT
+    event: verdict,
   });
 }
 
-async function run() {
-  const groqApiKey  = core.getInput("groq_api_key", { required: true });
-  const githubToken = core.getInput("github_token", { required: true });
-  const githubRepo  = getEnv("GITHUB_REPOSITORY");
-  const eventPath   = getEnv("GITHUB_EVENT_PATH");
-
-  const [owner, repo] = githubRepo.split("/");
-
-  const event    = JSON.parse(fs.readFileSync(eventPath, "utf8"));
-  const prNumber = event.pull_request?.number;
-  const commitId = event.pull_request?.head?.sha;
-  if (!prNumber) throw new Error("Could not determine PR number from event payload.");
-
-  console.log(`\n🔍  Reviewing PR #${prNumber} in ${owner}/${repo}\n`);
-
-  const octokit = new Octokit({ auth: githubToken });
-  const groq    = new Groq({ apiKey: groqApiKey });
-
+async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
   const { data: files } = await octokit.rest.pulls.listFiles({
-    owner,
-    repo,
-    pull_number: prNumber,
-    per_page: 100,
+    owner, repo, pull_number: prNumber, per_page: 100,
   });
 
   console.log(`📂  ${files.length} file(s) changed in this PR.`);
@@ -40973,18 +40955,13 @@ async function run() {
   const reviewable = files.filter((f) => !shouldSkip(f));
   const skipped    = files.length - reviewable.length;
 
-  if (skipped > 0) {
-    console.log(`⏭️   Skipping ${skipped} binary/lock/no-diff file(s).`);
-  }
-
+  if (skipped > 0) console.log(`⏭️   Skipping ${skipped} binary/lock/no-diff file(s).`);
   if (reviewable.length === 0) {
     console.log("ℹ️   No reviewable files found. Nothing to post.");
     return;
   }
 
-  // ── Review each file ──────────────────────────────────────────────────────
   const results = [];
-
   for (const file of reviewable) {
     console.log(`  → Reviewing: ${file.filename}`);
     try {
@@ -40994,18 +40971,18 @@ async function run() {
       results.push({ filename: file.filename, feedback, verdict, error: null });
       console.log(`    Verdict: ${verdict}`);
     } catch (err) {
-      console.error(`  ✗ Groq API error for ${file.filename}: ${err.message}`);
+      console.error(`  ✗ Groq error for ${file.filename}: ${err.message}`);
       results.push({ filename: file.filename, feedback: null, verdict: "COMMENT", error: err.message });
     }
   }
 
-  // ── Build consolidated review body ────────────────────────────────────────
   const finalVerdict = overallVerdict(results);
 
   const lines = [
     `## 🤖 AI Code Review — ${verdictEmoji(finalVerdict)}`,
     "",
     `> Powered by **Groq** (\`${GROQ_MODEL}\`) · Checks: Security · Bugs · Performance · Maintainability`,
+    `> 💡 Comment \`/fix\` on this PR to auto-apply all fixes.`,
     "",
     "---",
     "",
@@ -41015,11 +40992,7 @@ async function run() {
     const icon = verdict === "APPROVE" ? "✅" : verdict === "REQUEST_CHANGES" ? "❌" : "💬";
     lines.push(`### ${icon} \`${filename}\``);
     lines.push("");
-    if (error) {
-      lines.push(`> ⚠️ Review skipped — API error: ${error}`);
-    } else {
-      lines.push(feedback);
-    }
+    lines.push(error ? `> ⚠️ Review skipped — API error: ${error}` : feedback);
     lines.push("");
     lines.push("---");
     lines.push("");
@@ -41029,14 +41002,176 @@ async function run() {
     `<sub>Reviewed ${reviewable.length} file(s) · ${new Date().toUTCString()} · Overall: **${finalVerdict}**</sub>`
   );
 
-  const body = lines.join("\n");
-
-  // ── Post as a proper PR review ────────────────────────────────────────────
-  await postReview(octokit, { owner, repo, prNumber, body, verdict: finalVerdict, commitId });
+  await postReview(octokit, { owner, repo, prNumber, body: lines.join("\n"), verdict: finalVerdict, commitId });
   console.log(`\n✅  Review posted on PR #${prNumber} — ${finalVerdict}`);
 }
 
-run().catch((err) => {
+// ── Fix mode ──────────────────────────────────────────────────────────────────
+
+async function fixFileWithAI(groq, filename, content, feedback) {
+  const userMessage = `Fix ALL the issues listed below in this file.
+
+File: ${filename}
+
+Current file content:
+\`\`\`
+${truncate(content, MAX_FILE_CHARS)}
+\`\`\`
+
+Issues to fix:
+${feedback}
+
+Return ONLY the complete fixed file content. No explanations, no markdown code fences, no extra text.`;
+
+  const completion = await groq.chat.completions.create({
+    model: GROQ_MODEL,
+    messages: [
+      {
+        role: "system",
+        content: "You are an expert software engineer. Fix all issues in the provided code. Return ONLY the complete fixed source code — no markdown fences, no explanation, nothing else.",
+      },
+      { role: "user", content: userMessage },
+    ],
+    temperature: 0.1,
+    max_tokens: 4096,
+  });
+
+  return completion.choices[0]?.message?.content?.trim() ?? "";
+}
+
+async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
+  // Acknowledge with rocket reaction
+  try {
+    await octokit.rest.reactions.createForIssueComment({
+      owner, repo, comment_id: commentId, content: "rocket",
+    });
+  } catch (_) {}
+
+  // Get PR branch + latest commit sha
+  const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
+  const branch    = pr.head.ref;
+  const commitSha = pr.head.sha;
+
+  // Get changed files
+  const { data: files } = await octokit.rest.pulls.listFiles({
+    owner, repo, pull_number: prNumber, per_page: 100,
+  });
+
+  // Find the latest AI review comment
+  const { data: reviews } = await octokit.rest.pulls.listReviews({ owner, repo, pull_number: prNumber });
+  const botReview = [...reviews].reverse().find((r) => r.body?.includes("🤖 AI Code Review"));
+
+  if (!botReview) {
+    await octokit.rest.issues.createComment({
+      owner, repo, issue_number: prNumber,
+      body: "## 🤖 AI Fix\n\nNo AI review found on this PR. Open a review first by pushing a commit.",
+    });
+    return;
+  }
+
+  const fixed = [];
+  const failed = [];
+
+  for (const file of files.filter((f) => !shouldSkip(f))) {
+    // Extract this file's feedback from the review body
+    const regex = new RegExp(
+      `### [✅❌💬] \`${escapeRegex(file.filename)}\`([\\s\\S]*?)(?=###\\s|<sub>|$)`
+    );
+    const match = botReview.body?.match(regex);
+    const feedback = match?.[1]?.trim();
+
+    if (!feedback || feedback.includes("Review skipped")) continue;
+
+    console.log(`  → Fixing: ${file.filename}`);
+
+    try {
+      // Fetch full file content at PR head
+      const { data: fileData } = await octokit.rest.repos.getContent({
+        owner, repo, path: file.filename, ref: commitSha,
+      });
+
+      const original = Buffer.from(fileData.content, "base64").toString("utf8");
+      const fixedContent = await fixFileWithAI(groq, file.filename, original, feedback);
+
+      if (!fixedContent || fixedContent === original) {
+        console.log(`    No changes needed for ${file.filename}`);
+        continue;
+      }
+
+      // Commit the fixed file directly to the PR branch
+      await octokit.rest.repos.createOrUpdateFileContents({
+        owner, repo,
+        path: file.filename,
+        message: `fix(ai): auto-fix security issues in ${file.filename}`,
+        content: Buffer.from(fixedContent).toString("base64"),
+        sha: fileData.sha,
+        branch,
+      });
+
+      fixed.push(file.filename);
+      console.log(`    ✅ Fixed and committed: ${file.filename}`);
+    } catch (err) {
+      console.error(`    ✗ Failed to fix ${file.filename}: ${err.message}`);
+      failed.push({ file: file.filename, error: err.message });
+    }
+  }
+
+  // Post summary comment
+  const lines = ["## 🤖 AI Fix Applied", ""];
+
+  if (fixed.length > 0) {
+    lines.push(`Fixed and committed **${fixed.length}** file(s):`);
+    fixed.forEach((f) => lines.push(`- ✅ \`${f}\``));
+    lines.push("");
+    lines.push("> Review the committed changes above before merging.");
+  } else {
+    lines.push("No files were changed — issues may require manual fixes (e.g. moving secrets to env vars).");
+  }
+
+  if (failed.length > 0) {
+    lines.push("");
+    lines.push("Failed to fix:");
+    failed.forEach(({ file, error }) => lines.push(`- ❌ \`${file}\` — ${error}`));
+  }
+
+  await octokit.rest.issues.createComment({
+    owner, repo, issue_number: prNumber, body: lines.join("\n"),
+  });
+
+  console.log(`\n✅  Fix complete. ${fixed.length} file(s) updated.`);
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+async function main() {
+  const groqApiKey  = core.getInput("groq_api_key", { required: true });
+  const githubToken = core.getInput("github_token", { required: true });
+  const mode        = core.getInput("mode") || "review";
+  const githubRepo  = getEnv("GITHUB_REPOSITORY");
+  const eventPath   = getEnv("GITHUB_EVENT_PATH");
+
+  const [owner, repo] = githubRepo.split("/");
+  const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
+
+  const octokit = new Octokit({ auth: githubToken });
+  const groq    = new Groq({ apiKey: groqApiKey });
+
+  if (mode === "fix") {
+    const prNumber  = event.issue?.number;
+    const commentId = event.comment?.id;
+    if (!prNumber) throw new Error("Could not determine PR number from event payload.");
+    console.log(`\n🔧  Fixing issues on PR #${prNumber} in ${owner}/${repo}\n`);
+    await runFix(octokit, groq, { owner, repo, prNumber, commentId });
+  } else {
+    const prNumber = event.pull_request?.number;
+    const commitId = event.pull_request?.head?.sha;
+    if (!prNumber) throw new Error("Could not determine PR number from event payload.");
+    console.log(`\n🔍  Reviewing PR #${prNumber} in ${owner}/${repo}\n`);
+    await runReview(octokit, groq, { owner, repo, prNumber, commitId });
+  }
+}
+
+main().catch((err) => {
   console.error("Fatal error:", err.message);
   process.exit(1);
 });

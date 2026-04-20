@@ -1,0 +1,24 @@
+name: AI Fix Issues
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  fix:
+    name: Auto-fix issues with Groq AI
+    runs-on: ubuntu-latest
+    if: github.event.issue.pull_request != null && contains(github.event.comment.body, '/fix')
+
+    steps:
+      - name: Run AI fixer
+        uses: krishthesmart/github-code-reviewer@v1
+        with:
+          groq_api_key: ${{ secrets.GROQ_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          mode: fix

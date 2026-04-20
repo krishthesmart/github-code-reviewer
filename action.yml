@@ -9,6 +9,10 @@ inputs:
   github_token:
     description: GitHub token for posting reviews (use secrets.GITHUB_TOKEN)
     required: true
+  mode:
+    description: "review (default) or fix"
+    required: false
+    default: review
 
 branding:
   icon: eye

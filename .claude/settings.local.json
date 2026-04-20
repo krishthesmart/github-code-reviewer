@@ -2,7 +2,18 @@
   "permissions": {
     "allow": [
       "Bash(mkdir -p \"/Users/arulmeiyappan/ai /github code reviewer/ai-code-reviewer/src\")",
-      "Bash(mkdir -p \"/Users/arulmeiyappan/ai /github code reviewer/ai-code-reviewer/.github/workflows\")"
+      "Bash(mkdir -p \"/Users/arulmeiyappan/ai /github code reviewer/ai-code-reviewer/.github/workflows\")",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git checkout *)",
+      "Bash(git merge *)",
+      "Bash(git push *)",
+      "Bash(git tag *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git pull *)",
+      "Bash(gh pr *)"
     ]
   }
 }

@@ -412,50 +412,41 @@ Return ONLY the complete fixed file content. No explanations, no markdown fences
   return completion.choices[0]?.message?.content?.trim() ?? "";
 }
 
-async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
-  try {
-    await octokit.rest.reactions.createForIssueComment({
-      owner, repo, comment_id: commentId, content: "rocket",
-    });
-  } catch (_) {}
+async function runFix(octokit, groq, { owner, repo, prNumber, commentId, prBranch, commitSha, botReview }) {
+  if (commentId) {
+    try { await octokit.rest.reactions.createForIssueComment({ owner, repo, comment_id: commentId, content: "rocket" }); } catch (_) {}
+  }
 
-  const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
-  const commitSha  = pr.head.sha;
-  const baseBranch = pr.head.ref;
+  // Fetch PR info if not provided (manual /fix command)
+  if (!prBranch || !commitSha) {
+    const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
+    prBranch  = pr.head.ref;
+    commitSha = pr.head.sha;
+  }
 
-  const { data: reviews } = await octokit.rest.pulls.listReviews({ owner, repo, pull_number: prNumber });
-  const botReview = [...reviews].reverse().find((r) => r.body?.includes("🤖 AI Code Review"));
+  // Find latest bot review if not provided
+  if (!botReview) {
+    const { data: reviews } = await octokit.rest.pulls.listReviews({ owner, repo, pull_number: prNumber });
+    botReview = [...reviews].reverse().find((r) => r.body?.includes("🤖 AI Code Review"));
+  }
 
   if (!botReview) {
     await octokit.rest.issues.createComment({
       owner, repo, issue_number: prNumber,
-      body: "## 🤖 AI Fix\n\nNo AI review found. Push a commit to trigger a review first.",
+      body: "## 🤖 AI Fix\n\nNo AI review found on this PR yet.",
     });
     return;
   }
 
-  const { data: files } = await octokit.rest.pulls.listFiles({
-    owner, repo, pull_number: prNumber, per_page: 100,
-  });
-
-  // Create (or reset) the fix branch
-  const fixBranch = `ai-fix/pr-${prNumber}`;
-  try {
-    await octokit.rest.git.createRef({ owner, repo, ref: `refs/heads/${fixBranch}`, sha: commitSha });
-    console.log(`  → Created branch: ${fixBranch}`);
-  } catch (err) {
-    if (err.status === 422) {
-      await octokit.rest.git.updateRef({ owner, repo, ref: `heads/${fixBranch}`, sha: commitSha, force: true });
-      console.log(`  → Reset branch: ${fixBranch}`);
-    } else throw err;
-  }
+  const { data: files } = await octokit.rest.pulls.listFiles({ owner, repo, pull_number: prNumber, per_page: 100 });
 
   const fixed  = [];
   const failed = [];
 
   for (const file of files.filter((f) => !shouldSkip(f))) {
+    // Extract the full file section from the review body (handles both old ### and new #### format)
     const regex = new RegExp(
-      `### [✅❌💬] \`${escapeRegex(file.filename)}\`([\\s\\S]*?)(?=###\\s|<sub>|$)`
+      `### [✅❌💬] \`${escapeRegex(file.filename)}\`([\\s\\S]*?)(?=^### |<sub>|$)`, "m"
     );
     const match    = botReview.body?.match(regex);
     const feedback = match?.[1]?.trim();
@@ -490,57 +481,39 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
       }
       if (!check.skipped) console.log(`    ✓ Syntax OK`);
 
+      // Commit directly to the PR branch
       await octokit.rest.repos.createOrUpdateFileContents({
         owner, repo,
         path: file.filename,
         message: `fix(ai): auto-fix issues in ${file.filename}`,
         content: Buffer.from(fixedContent).toString("base64"),
         sha: fileData.sha,
-        branch: fixBranch,
+        branch: prBranch,
       });
 
       fixed.push(file.filename);
-      console.log(`    ✅ Committed`);
+      console.log(`    ✅ Committed to ${prBranch}`);
     } catch (err) {
       console.error(`    ✗ Failed: ${err.message}`);
       failed.push({ file: file.filename, error: err.message });
     }
   }
 
-  if (fixed.length === 0) {
-    await octokit.rest.issues.createComment({
-      owner, repo, issue_number: prNumber,
-      body: `## 🤖 AI Fix\n\nNo files could be fixed automatically.\n\n${failed.map(({ file, error }) => `- ❌ \`${file}\` — ${error}`).join("\n")}`,
-    });
-    return;
+  const lines = ["## 🤖 AI Auto-Fix", ""];
+  if (fixed.length > 0) {
+    lines.push(`Applied fixes directly to \`${prBranch}\`:`, "");
+    fixed.forEach((f) => lines.push(`- ✅ \`${f}\``));
+    lines.push("", "A new review will run automatically on the updated code.");
+  } else {
+    lines.push("No files could be fixed automatically.", "");
+  }
+  if (failed.length > 0) {
+    lines.push("", "**Needs manual attention:**");
+    failed.forEach(({ file, error }) => lines.push(`- ❌ \`${file}\` — ${error}`));
   }
 
-  const fixPrBody = [
-    `## 🤖 AI Fix for #${prNumber}`,
-    "",
-    `Auto-applied fixes based on the AI review of PR #${prNumber}.`,
-    "",
-    "**Fixed:**",
-    ...fixed.map((f) => `- ✅ \`${f}\``),
-    ...(failed.length > 0 ? ["", "**Could not fix (manual action needed):**", ...failed.map(({ file, error }) => `- ❌ \`${file}\` — ${error}`)] : []),
-    "",
-    "> Review these changes carefully before merging.",
-  ].join("\n");
-
-  const { data: fixPr } = await octokit.rest.pulls.create({
-    owner, repo,
-    title: `🤖 AI Fix: auto-fix issues from PR #${prNumber}`,
-    body: fixPrBody,
-    head: fixBranch,
-    base: baseBranch,
-  });
-
-  await octokit.rest.issues.createComment({
-    owner, repo, issue_number: prNumber,
-    body: `## 🤖 AI Fix Ready\n\nCreated fix PR: **${fixPr.html_url}**\n\nReview and merge when ready.`,
-  });
-
-  console.log(`\n✅  Fix PR: ${fixPr.html_url}`);
+  await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: lines.join("\n") });
+  console.log(`\n✅  Fixed ${fixed.length} file(s) directly on ${prBranch}`);
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -580,14 +553,28 @@ async function main() {
     await runReview(octokit, groq, { owner, repo, prNumber, commitId });
   } else {
     // pull_request event
-    const prNumber = event.pull_request?.number;
-    const commitId = event.pull_request?.head?.sha;
+    const prNumber  = event.pull_request?.number;
+    const commitId  = event.pull_request?.head?.sha;
+    const prBranch  = event.pull_request?.head?.ref;
     if (!prNumber) throw new Error("Could not determine PR number from event payload.");
+
+    // Guard: skip auto-fix if the last push was already a bot fix (prevents infinite loops)
+    const { data: commitData } = await octokit.rest.repos.getCommit({ owner, repo, ref: commitId });
+    const lastMsg    = commitData.commit?.message || "";
+    const lastAuthor = commitData.author?.login   || "";
+    const isBotCommit = lastMsg.startsWith("fix(ai):") || lastAuthor === "github-actions[bot]";
+
     console.log(`\n🔍  Reviewing PR #${prNumber} in ${owner}/${repo}\n`);
     const verdict = await runReview(octokit, groq, { owner, repo, prNumber, commitId });
-    if (autoFix && verdict === "REQUEST_CHANGES") {
-      console.log(`\n🔧  Auto-fix enabled — fixing PR #${prNumber} automatically\n`);
-      await runFix(octokit, groq, { owner, repo, prNumber, commentId: null });
+
+    if (autoFix && verdict === "REQUEST_CHANGES" && !isBotCommit) {
+      console.log(`\n🔧  Auto-fix: applying fixes to ${prBranch}\n`);
+      // Fetch the review we just posted so we can pass it directly (avoids extra API call)
+      const { data: reviews } = await octokit.rest.pulls.listReviews({ owner, repo, pull_number: prNumber });
+      const botReview = [...reviews].reverse().find((r) => r.body?.includes("🤖 AI Code Review"));
+      await runFix(octokit, groq, { owner, repo, prNumber, commentId: null, prBranch, commitSha: commitId, botReview });
+    } else if (autoFix && isBotCommit) {
+      console.log(`ℹ️  Last commit was an AI fix — skipping auto-fix to prevent loop`);
     }
   }
 }

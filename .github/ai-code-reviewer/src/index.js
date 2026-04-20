@@ -254,8 +254,8 @@ function validateSyntax(content, filename) {
 
 // ── Fix mode ──────────────────────────────────────────────────────────────────
 
-async function fixFileWithAI(groq, filename, content, feedback) {
-  const userMessage = `Fix ALL the issues listed below in this file.
+async function fixFileWithAI(groq, filename, content, feedback, priorSyntaxError = null) {
+  let userMessage = `Fix ALL the issues listed below in this file.
 
 File: ${filename}
 
@@ -268,6 +268,10 @@ Issues to fix:
 ${feedback}
 
 Return ONLY the complete fixed file content. No explanations, no markdown code fences, no extra text.`;
+
+  if (priorSyntaxError) {
+    userMessage += `\n\nWARNING: Your previous attempt produced invalid syntax:\n${priorSyntaxError}\nFix the syntax error too. Remember to use backticks for template literals in JS, not HTML tags directly in function calls.`;
+  }
 
   const completion = await groq.chat.completions.create({
     model: GROQ_MODEL,
@@ -354,18 +358,24 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
         owner, repo, path: file.filename, ref: commitSha,
       });
 
-      const original    = Buffer.from(fileData.content, "base64").toString("utf8");
-      const fixedContent = await fixFileWithAI(groq, file.filename, original, feedback);
+      const original = Buffer.from(fileData.content, "base64").toString("utf8");
+      let fixedContent = await fixFileWithAI(groq, file.filename, original, feedback);
 
       if (!fixedContent || fixedContent === original) {
         console.log(`    No changes needed for ${file.filename}`);
         continue;
       }
 
-      const check = validateSyntax(fixedContent, file.filename);
+      let check = validateSyntax(fixedContent, file.filename);
       if (!check.valid) {
-        console.error(`    ✗ Syntax check failed: ${check.error}`);
-        failed.push({ file: file.filename, error: `Syntax check failed: ${check.error}` });
+        console.log(`    ↻ Syntax error — retrying with error feedback...`);
+        fixedContent = await fixFileWithAI(groq, file.filename, original, feedback, check.error);
+        check = validateSyntax(fixedContent, file.filename);
+      }
+
+      if (!check.valid) {
+        console.error(`    ✗ Syntax still invalid after retry: ${check.error}`);
+        failed.push({ file: file.filename, error: `Syntax check failed after retry: ${check.error}` });
         continue;
       }
       if (!check.skipped) console.log(`    ✓ Syntax check passed`);

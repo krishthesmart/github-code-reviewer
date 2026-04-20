@@ -2,6 +2,9 @@ const { Octokit } = require("@octokit/rest");
 const Groq = require("groq-sdk");
 const core = require("@actions/core");
 const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawnSync } = require("child_process");
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -215,6 +218,40 @@ async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
   console.log(`\n✅  Review posted on PR #${prNumber} — ${finalVerdict}`);
 }
 
+// ── Syntax validation ─────────────────────────────────────────────────────────
+
+function validateSyntax(content, filename) {
+  const ext = path.extname(filename).toLowerCase();
+  const tmpFile = path.join(os.tmpdir(), `ai-fix-${Date.now()}${ext}`);
+
+  try {
+    fs.writeFileSync(tmpFile, content, "utf8");
+
+    let result;
+    if ([".js", ".mjs", ".cjs"].includes(ext)) {
+      result = spawnSync("node", ["--check", tmpFile], { encoding: "utf8", timeout: 10000 });
+    } else if (ext === ".py") {
+      result = spawnSync("python3", ["-m", "py_compile", tmpFile], { encoding: "utf8", timeout: 10000 });
+    } else if (ext === ".rb") {
+      result = spawnSync("ruby", ["-c", tmpFile], { encoding: "utf8", timeout: 10000 });
+    } else if (ext === ".sh") {
+      result = spawnSync("bash", ["-n", tmpFile], { encoding: "utf8", timeout: 10000 });
+    } else {
+      return { valid: true, skipped: true };
+    }
+
+    if (result.status !== 0) {
+      const errMsg = (result.stderr || result.stdout || "syntax error").trim();
+      return { valid: false, error: errMsg };
+    }
+    return { valid: true };
+  } catch (err) {
+    return { valid: false, error: err.message };
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch (_) {}
+  }
+}
+
 // ── Fix mode ──────────────────────────────────────────────────────────────────
 
 async function fixFileWithAI(groq, filename, content, feedback) {
@@ -305,6 +342,17 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
       if (!fixedContent || fixedContent === original) {
         console.log(`    No changes needed for ${file.filename}`);
         continue;
+      }
+
+      // Validate syntax before committing
+      const check = validateSyntax(fixedContent, file.filename);
+      if (!check.valid) {
+        console.error(`    ✗ Syntax check failed for ${file.filename}: ${check.error}`);
+        failed.push({ file: file.filename, error: `Syntax check failed — fix skipped to avoid breaking your code. Error: ${check.error}` });
+        continue;
+      }
+      if (!check.skipped) {
+        console.log(`    ✓ Syntax check passed for ${file.filename}`);
       }
 
       // Commit the fixed file directly to the PR branch

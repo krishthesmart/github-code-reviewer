@@ -41324,6 +41324,19 @@ async function main() {
     if (!prNumber) throw new Error("Could not determine PR number from event payload.");
     console.log(`\n🔧  Fixing PR #${prNumber} in ${owner}/${repo}\n`);
     await runFix(octokit, groq, { owner, repo, prNumber, commentId });
+  } else if (event.issue) {
+    // /review triggered via issue_comment — look up PR head sha from API
+    const prNumber  = event.issue.number;
+    const commentId = event.comment?.id;
+    try {
+      await octokit.rest.reactions.createForIssueComment({
+        owner, repo, comment_id: commentId, content: "eyes",
+      });
+    } catch (_) {}
+    const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
+    const commitId = pr.head.sha;
+    console.log(`\n🔍  Reviewing PR #${prNumber} in ${owner}/${repo}\n`);
+    await runReview(octokit, groq, { owner, repo, prNumber, commitId });
   } else {
     const prNumber = event.pull_request?.number;
     const commitId = event.pull_request?.head?.sha;

@@ -40938,14 +40938,18 @@ async function reviewFile(groq, filename, patch) {
 }
 
 async function postReview(octokit, { owner, repo, prNumber, body, verdict, commitId }) {
-  await octokit.rest.pulls.createReview({
-    owner,
-    repo,
-    pull_number: prNumber,
-    commit_id: commitId,
-    body,
-    event: verdict,
-  });
+  try {
+    await octokit.rest.pulls.createReview({
+      owner, repo, pull_number: prNumber, commit_id: commitId, body, event: verdict,
+    });
+  } catch (err) {
+    if (err.message?.includes("own pull request")) {
+      // Bot can't request changes on its own PR — fall back to plain comment
+      await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+    } else {
+      throw err;
+    }
+  }
 }
 
 async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {

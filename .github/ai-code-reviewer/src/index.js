@@ -16,67 +16,54 @@ const SKIP_EXTENSIONS = new Set([
   "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
 ]);
 
-const REVIEW_SYSTEM_PROMPT = `You are a senior security-focused code reviewer. Analyze the provided diff thoroughly.
+const SEVERITY_EMOJI = {
+  CRITICAL:   "🔴",
+  HIGH:       "🟠",
+  MEDIUM:     "🟡",
+  LOW:        "🟢",
+  SUGGESTION: "💡",
+};
 
-For every issue found, use EXACTLY this format:
-**[SEVERITY] Category — Description**
-Then a short explanation and fix suggestion on the next line.
+const REVIEW_SYSTEM_PROMPT = `You are a senior security-focused code reviewer. Analyze the provided diff.
 
-Severity levels:
-🔴 CRITICAL — exploit risk, data loss, auth bypass, secrets exposed
-🟠 HIGH     — security vulnerability, serious bug, data corruption
-🟡 MEDIUM   — logic error, missing validation, poor error handling
-🟢 LOW      — code smell, minor inefficiency, readability
-💡 SUGGESTION — best practice, improvement idea
+Respond with ONLY valid JSON in this exact format (no other text):
+{
+  "verdict": "REQUEST_CHANGES",
+  "summary": "One paragraph overall assessment.",
+  "issues": [
+    {
+      "line": 42,
+      "severity": "CRITICAL",
+      "category": "Security",
+      "title": "Short title of the issue",
+      "body": "Explanation of the problem and how to fix it in markdown."
+    }
+  ]
+}
 
-Categories to check:
-**Security (OWASP Top 10 + more):**
-- SQL/Command/LDAP/XPath injection
-- XSS and output encoding
-- Broken authentication, insecure tokens, weak passwords
-- Sensitive data exposure (secrets, API keys, PII in logs or code)
-- SSRF, path traversal, XXE
-- Insecure deserialization
-- Broken access control, missing authorization checks
-- Security misconfiguration (CORS, headers, verbose errors)
+verdict rules:
+- "REQUEST_CHANGES" if any CRITICAL or HIGH issues exist
+- "APPROVE" if the diff looks clean with no significant issues
+- "COMMENT" for minor/suggestion-only issues
+
+severity values: CRITICAL, HIGH, MEDIUM, LOW, SUGGESTION
+category values: Security, Bug, Performance, Maintainability
+
+line: the line number in the NEW file where the issue appears (from the + lines in the diff).
+      Use null if the issue is not tied to a specific line.
+
+Security checks (OWASP Top 10 + more):
+- SQL/Command/LDAP injection, XSS, SSRF, path traversal, XXE
+- Broken auth, insecure tokens, weak passwords
+- Hardcoded secrets, API keys, PII in logs
+- Broken access control, missing auth checks
+- Security misconfiguration, verbose errors
 - Known vulnerable dependencies
-- Insufficient logging of security events
-- Hardcoded credentials or secrets
 
-**Bugs:**
-- Logic errors and incorrect conditions
-- Null/undefined dereference
-- Off-by-one errors
-- Race conditions and concurrency issues
-- Memory leaks
-- Unhandled promise rejections or exceptions
-- Edge cases not handled
+Also check: bugs, logic errors, null dereference, race conditions, memory leaks,
+unhandled exceptions, performance issues, dead code, missing input validation.
 
-**Performance:**
-- N+1 database queries
-- Unnecessary loops or recomputation
-- Missing indexes or caching
-- Blocking async operations
-- Large payload handling
-
-**Maintainability:**
-- Dead or unreachable code
-- Overly complex logic that should be simplified
-- Missing input validation at system boundaries
-- Inconsistent error handling patterns
-- Functions doing too many things
-
-End your response with one of these exact lines:
-VERDICT: APPROVE
-VERDICT: REQUEST_CHANGES
-VERDICT: COMMENT
-
-Use REQUEST_CHANGES if there are any 🔴 CRITICAL or 🟠 HIGH issues.
-Use APPROVE only if the diff looks clean with no significant issues.
-Use COMMENT for minor issues only.
-
-If the diff is clean, say so briefly and use VERDICT: APPROVE.
-Do not repeat the diff. Be specific and actionable.`;
+Return ONLY the JSON. No markdown fences, no explanation outside the JSON.`;
 
 const MAX_DIFF_CHARS = 15_000;
 const MAX_FILE_CHARS = 20_000;
@@ -103,19 +90,29 @@ function truncate(str, max) {
   return str.slice(0, max) + `\n\n[...truncated at ${max} chars...]`;
 }
 
-function parseVerdict(feedback) {
-  const match = feedback.match(/VERDICT:\s*(APPROVE|REQUEST_CHANGES|COMMENT)/i);
-  return match ? match[1].toUpperCase() : "COMMENT";
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function stripVerdict(feedback) {
-  return feedback.replace(/\nVERDICT:\s*(APPROVE|REQUEST_CHANGES|COMMENT)\s*$/i, "").trim();
+function parseReviewJSON(raw) {
+  try {
+    const cleaned = raw.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
+    return JSON.parse(cleaned);
+  } catch {
+    // Fallback: extract JSON object from response
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (match) {
+      try { return JSON.parse(match[0]); } catch { /* fall through */ }
+    }
+    return null;
+  }
 }
 
-function overallVerdict(results) {
-  if (results.some((r) => r.verdict === "REQUEST_CHANGES")) return "REQUEST_CHANGES";
-  if (results.every((r) => r.verdict === "APPROVE")) return "APPROVE";
-  return "COMMENT";
+function countBySeverity(issues) {
+  return issues.reduce((acc, i) => {
+    acc[i.severity] = (acc[i.severity] || 0) + 1;
+    return acc;
+  }, {});
 }
 
 function verdictEmoji(verdict) {
@@ -124,102 +121,10 @@ function verdictEmoji(verdict) {
   return "💬 COMMENTED";
 }
 
-function escapeRegex(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-// ── Review mode ───────────────────────────────────────────────────────────────
-
-async function reviewFile(groq, filename, patch) {
-  const userMessage = `File: ${filename}\n\n\`\`\`diff\n${truncate(patch, MAX_DIFF_CHARS)}\n\`\`\``;
-
-  const completion = await groq.chat.completions.create({
-    model: GROQ_MODEL,
-    messages: [
-      { role: "system", content: REVIEW_SYSTEM_PROMPT },
-      { role: "user", content: userMessage },
-    ],
-    temperature: 0.1,
-    max_tokens: 2048,
-  });
-
-  return completion.choices[0]?.message?.content?.trim() ?? "(no response)";
-}
-
-async function postReview(octokit, { owner, repo, prNumber, body, verdict, commitId }) {
-  try {
-    await octokit.rest.pulls.createReview({
-      owner, repo, pull_number: prNumber, commit_id: commitId, body, event: verdict,
-    });
-  } catch (err) {
-    if (err.message?.includes("own pull request")) {
-      // Bot can't request changes on its own PR — fall back to plain comment
-      await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
-    } else {
-      throw err;
-    }
-  }
-}
-
-async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
-  const { data: files } = await octokit.rest.pulls.listFiles({
-    owner, repo, pull_number: prNumber, per_page: 100,
-  });
-
-  console.log(`📂  ${files.length} file(s) changed in this PR.`);
-
-  const reviewable = files.filter((f) => !shouldSkip(f));
-  const skipped    = files.length - reviewable.length;
-
-  if (skipped > 0) console.log(`⏭️   Skipping ${skipped} binary/lock/no-diff file(s).`);
-  if (reviewable.length === 0) {
-    console.log("ℹ️   No reviewable files found. Nothing to post.");
-    return;
-  }
-
-  const results = [];
-  for (const file of reviewable) {
-    console.log(`  → Reviewing: ${file.filename}`);
-    try {
-      const raw      = await reviewFile(groq, file.filename, file.patch);
-      const verdict  = parseVerdict(raw);
-      const feedback = stripVerdict(raw);
-      results.push({ filename: file.filename, feedback, verdict, error: null });
-      console.log(`    Verdict: ${verdict}`);
-    } catch (err) {
-      console.error(`  ✗ Groq error for ${file.filename}: ${err.message}`);
-      results.push({ filename: file.filename, feedback: null, verdict: "COMMENT", error: err.message });
-    }
-  }
-
-  const finalVerdict = overallVerdict(results);
-
-  const lines = [
-    `## 🤖 AI Code Review — ${verdictEmoji(finalVerdict)}`,
-    "",
-    `> Powered by **Groq** (\`${GROQ_MODEL}\`) · Checks: Security · Bugs · Performance · Maintainability`,
-    `> 💡 Comment \`/fix\` on this PR to auto-apply all fixes.`,
-    "",
-    "---",
-    "",
-  ];
-
-  for (const { filename, feedback, verdict, error } of results) {
-    const icon = verdict === "APPROVE" ? "✅" : verdict === "REQUEST_CHANGES" ? "❌" : "💬";
-    lines.push(`### ${icon} \`${filename}\``);
-    lines.push("");
-    lines.push(error ? `> ⚠️ Review skipped — API error: ${error}` : feedback);
-    lines.push("");
-    lines.push("---");
-    lines.push("");
-  }
-
-  lines.push(
-    `<sub>Reviewed ${reviewable.length} file(s) · ${new Date().toUTCString()} · Overall: **${finalVerdict}**</sub>`
-  );
-
-  await postReview(octokit, { owner, repo, prNumber, body: lines.join("\n"), verdict: finalVerdict, commitId });
-  console.log(`\n✅  Review posted on PR #${prNumber} — ${finalVerdict}`);
+function overallVerdict(results) {
+  if (results.some((r) => r.verdict === "REQUEST_CHANGES")) return "REQUEST_CHANGES";
+  if (results.every((r) => r.verdict === "APPROVE")) return "APPROVE";
+  return "COMMENT";
 }
 
 // ── Syntax validation ─────────────────────────────────────────────────────────
@@ -227,10 +132,8 @@ async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
 function validateSyntax(content, filename) {
   const ext = path.extname(filename).toLowerCase();
   const tmpFile = path.join(os.tmpdir(), `ai-fix-${Date.now()}${ext}`);
-
   try {
     fs.writeFileSync(tmpFile, content, "utf8");
-
     let result;
     if ([".js", ".mjs", ".cjs"].includes(ext)) {
       result = spawnSync("node", ["--check", tmpFile], { encoding: "utf8", timeout: 10000 });
@@ -243,10 +146,8 @@ function validateSyntax(content, filename) {
     } else {
       return { valid: true, skipped: true };
     }
-
     if (result.status !== 0) {
-      const errMsg = (result.stderr || result.stdout || "syntax error").trim();
-      return { valid: false, error: errMsg };
+      return { valid: false, error: (result.stderr || result.stdout || "syntax error").trim() };
     }
     return { valid: true };
   } catch (err) {
@@ -256,10 +157,184 @@ function validateSyntax(content, filename) {
   }
 }
 
+// ── Review mode ───────────────────────────────────────────────────────────────
+
+async function reviewFile(groq, filename, patch) {
+  const userMessage = `File: ${filename}\n\n\`\`\`diff\n${truncate(patch, MAX_DIFF_CHARS)}\n\`\`\``;
+  const completion = await groq.chat.completions.create({
+    model: GROQ_MODEL,
+    messages: [
+      { role: "system", content: REVIEW_SYSTEM_PROMPT },
+      { role: "user", content: userMessage },
+    ],
+    temperature: 0.1,
+    max_tokens: 2048,
+  });
+  return completion.choices[0]?.message?.content?.trim() ?? "{}";
+}
+
+async function dismissStaleReviews(octokit, { owner, repo, prNumber }) {
+  try {
+    const { data: reviews } = await octokit.rest.pulls.listReviews({ owner, repo, pull_number: prNumber });
+    const stale = reviews.filter(
+      (r) => r.user?.login === "github-actions[bot]" && r.state === "CHANGES_REQUESTED"
+    );
+    for (const review of stale) {
+      await octokit.rest.pulls.dismissReview({
+        owner, repo, pull_number: prNumber,
+        review_id: review.id,
+        message: "Superseded by new review.",
+      });
+    }
+  } catch (_) {}
+}
+
+async function postReview(octokit, { owner, repo, prNumber, body, verdict, commitId, inlineComments }) {
+  try {
+    await octokit.rest.pulls.createReview({
+      owner, repo,
+      pull_number: prNumber,
+      commit_id: commitId,
+      body,
+      event: verdict,
+      comments: inlineComments,
+    });
+  } catch (err) {
+    if (err.message?.includes("own pull request")) {
+      await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+    } else {
+      throw err;
+    }
+  }
+}
+
+async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
+  await dismissStaleReviews(octokit, { owner, repo, prNumber });
+
+  const { data: files } = await octokit.rest.pulls.listFiles({
+    owner, repo, pull_number: prNumber, per_page: 100,
+  });
+
+  console.log(`📂  ${files.length} file(s) changed.`);
+
+  const reviewable = files.filter((f) => !shouldSkip(f));
+  if (reviewable.length === 0) {
+    console.log("ℹ️   No reviewable files.");
+    return;
+  }
+
+  const results = [];
+
+  for (const file of reviewable) {
+    console.log(`  → Reviewing: ${file.filename}`);
+    try {
+      const raw    = await reviewFile(groq, file.filename, file.patch);
+      const parsed = parseReviewJSON(raw);
+
+      if (!parsed) {
+        console.warn(`    Could not parse JSON response for ${file.filename}`);
+        results.push({ filename: file.filename, verdict: "COMMENT", issues: [], summary: raw, error: null });
+        continue;
+      }
+
+      results.push({
+        filename: file.filename,
+        verdict:  parsed.verdict || "COMMENT",
+        issues:   parsed.issues  || [],
+        summary:  parsed.summary || "",
+        error:    null,
+      });
+      console.log(`    Verdict: ${parsed.verdict} — ${parsed.issues?.length ?? 0} issue(s)`);
+    } catch (err) {
+      console.error(`  ✗ Error: ${err.message}`);
+      results.push({ filename: file.filename, verdict: "COMMENT", issues: [], summary: null, error: err.message });
+    }
+  }
+
+  const finalVerdict = overallVerdict(results);
+
+  // ── Build inline comments ────────────────────────────────────────────────
+  const inlineComments = [];
+  for (const { filename, issues } of results) {
+    for (const issue of issues) {
+      if (!issue.line) continue;
+      const emoji = SEVERITY_EMOJI[issue.severity] ?? "•";
+      inlineComments.push({
+        path: filename,
+        line: issue.line,
+        side: "RIGHT",
+        body: `${emoji} **${issue.severity} ${issue.category} — ${issue.title}**\n\n${issue.body}`,
+      });
+    }
+  }
+
+  // ── Build summary review body ────────────────────────────────────────────
+  const allIssues = results.flatMap((r) => r.issues);
+  const counts    = countBySeverity(allIssues);
+
+  const summaryLines = [
+    `## 🤖 AI Code Review — ${verdictEmoji(finalVerdict)}`,
+    "",
+    `> Powered by **Groq** (\`${GROQ_MODEL}\`) · Checks: Security · Bugs · Performance · Maintainability`,
+    `> 💡 Comment \`/fix\` to auto-apply fixes · \`/review\` to re-run review`,
+    "",
+  ];
+
+  if (allIssues.length > 0) {
+    summaryLines.push("**Issue summary:**");
+    for (const [sev, emoji] of Object.entries(SEVERITY_EMOJI)) {
+      if (counts[sev]) summaryLines.push(`${emoji} ${counts[sev]}x ${sev}`);
+    }
+    summaryLines.push("");
+  }
+
+  summaryLines.push("---", "");
+
+  for (const { filename, issues, summary, error } of results) {
+    const icon = issues.some((i) => ["CRITICAL","HIGH"].includes(i.severity)) ? "❌"
+               : issues.length === 0 ? "✅" : "💬";
+    summaryLines.push(`### ${icon} \`${filename}\``);
+    summaryLines.push("");
+    if (error) {
+      summaryLines.push(`> ⚠️ Review skipped — API error: ${error}`);
+    } else if (issues.length === 0) {
+      summaryLines.push(summary || "No issues found. Looks good! ✅");
+    } else {
+      if (summary) summaryLines.push(`> ${summary}`, "");
+      for (const issue of issues) {
+        const emoji = SEVERITY_EMOJI[issue.severity] ?? "•";
+        summaryLines.push(`**${emoji} ${issue.severity} ${issue.category} — ${issue.title}**`);
+        summaryLines.push(issue.body);
+        summaryLines.push("");
+      }
+    }
+    summaryLines.push("---", "");
+  }
+
+  summaryLines.push(
+    `<sub>Reviewed ${reviewable.length} file(s) · ${allIssues.length} issue(s) · ${new Date().toUTCString()}</sub>`
+  );
+
+  // Post inline comments with the review; fall back silently if any line is invalid
+  const safeInline = [];
+  for (const c of inlineComments) {
+    safeInline.push(c);
+  }
+
+  await postReview(octokit, {
+    owner, repo, prNumber,
+    body: summaryLines.join("\n"),
+    verdict: finalVerdict,
+    commitId,
+    inlineComments: safeInline,
+  });
+
+  console.log(`\n✅  Review posted — ${finalVerdict} · ${allIssues.length} issue(s) · ${inlineComments.length} inline comment(s)`);
+}
+
 // ── Fix mode ──────────────────────────────────────────────────────────────────
 
 function postProcessCode(content) {
-  // Fix most common AI mistake: res.send(<html>) → res.send(`<html>`)
   return content.replace(
     /(\.\w+\s*\()\s*(<[^)]{0,500}>)\s*\)/g,
     (_, call, html) => `${call}\`${html}\`)`
@@ -267,7 +342,7 @@ function postProcessCode(content) {
 }
 
 async function fixFileWithAI(groq, filename, content, feedback, priorSyntaxError = null) {
-  const ext = path.extname(filename).toLowerCase();
+  const ext  = path.extname(filename).toLowerCase();
   const isJS = [".js", ".mjs", ".cjs", ".ts", ".tsx"].includes(ext);
 
   let userMessage = `Fix ALL the issues listed below in this file.
@@ -282,25 +357,21 @@ ${truncate(content, MAX_FILE_CHARS)}
 Issues to fix:
 ${feedback}
 ${isJS ? `
-CRITICAL JAVASCRIPT SYNTAX RULES — violating these causes a SyntaxError:
+CRITICAL JAVASCRIPT SYNTAX RULES:
 - NEVER use JSX syntax. This is plain JavaScript, not React.
-- To send HTML in Express: use a template literal → res.send(\`<h1>Hello \${name}</h1>\`)
-- NEVER write: res.send(<h1>Hello \${name}</h1>) — angle brackets are NOT valid here
-- String concatenation is also valid: res.send('<h1>Hello ' + name + '</h1>')
+- To send HTML in Express use template literals: res.send(\`<h1>Hello \${name}</h1>\`)
+- NEVER write: res.send(<h1>...</h1>) — this is a SyntaxError
 ` : ""}
-Return ONLY the complete fixed file content. No explanations, no markdown code fences, no extra text.`;
+Return ONLY the complete fixed file content. No explanations, no markdown fences.`;
 
   if (priorSyntaxError) {
-    userMessage += `\n\nYour previous attempt had this syntax error:\n${priorSyntaxError}\nDo NOT repeat the same mistake.`;
+    userMessage += `\n\nPrevious attempt had this syntax error — do NOT repeat it:\n${priorSyntaxError}`;
   }
 
   const completion = await groq.chat.completions.create({
     model: GROQ_MODEL,
     messages: [
-      {
-        role: "system",
-        content: "You are an expert software engineer. Fix all issues in the provided code. Return ONLY the complete fixed source code — no markdown fences, no explanation, nothing else.",
-      },
+      { role: "system", content: "You are an expert software engineer. Fix all issues in the provided code. Return ONLY the complete fixed source code — no markdown fences, no explanation, nothing else." },
       { role: "user", content: userMessage },
     ],
     temperature: 0.1,
@@ -327,7 +398,7 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
   if (!botReview) {
     await octokit.rest.issues.createComment({
       owner, repo, issue_number: prNumber,
-      body: "## 🤖 AI Fix\n\nNo AI review found on this PR. Push a commit to trigger a review first.",
+      body: "## 🤖 AI Fix\n\nNo AI review found. Push a commit to trigger a review first.",
     });
     return;
   }
@@ -336,87 +407,69 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
     owner, repo, pull_number: prNumber, per_page: 100,
   });
 
-  // Create new fix branch from the PR head
+  // Create (or reset) the fix branch
   const fixBranch = `ai-fix/pr-${prNumber}`;
   try {
-    await octokit.rest.git.createRef({
-      owner, repo,
-      ref: `refs/heads/${fixBranch}`,
-      sha: commitSha,
-    });
+    await octokit.rest.git.createRef({ owner, repo, ref: `refs/heads/${fixBranch}`, sha: commitSha });
     console.log(`  → Created branch: ${fixBranch}`);
   } catch (err) {
     if (err.status === 422) {
-      // Branch already exists — update it to point to current head
-      await octokit.rest.git.updateRef({
-        owner, repo,
-        ref: `heads/${fixBranch}`,
-        sha: commitSha,
-        force: true,
-      });
-      console.log(`  → Reset existing branch: ${fixBranch}`);
-    } else {
-      throw err;
-    }
+      await octokit.rest.git.updateRef({ owner, repo, ref: `heads/${fixBranch}`, sha: commitSha, force: true });
+      console.log(`  → Reset branch: ${fixBranch}`);
+    } else throw err;
   }
 
-  const fixed = [];
+  const fixed  = [];
   const failed = [];
 
   for (const file of files.filter((f) => !shouldSkip(f))) {
     const regex = new RegExp(
       `### [✅❌💬] \`${escapeRegex(file.filename)}\`([\\s\\S]*?)(?=###\\s|<sub>|$)`
     );
-    const match = botReview.body?.match(regex);
+    const match    = botReview.body?.match(regex);
     const feedback = match?.[1]?.trim();
 
     if (!feedback || feedback.includes("Review skipped")) continue;
 
     console.log(`  → Fixing: ${file.filename}`);
-
     try {
       const { data: fileData } = await octokit.rest.repos.getContent({
         owner, repo, path: file.filename, ref: commitSha,
       });
 
-      const original = Buffer.from(fileData.content, "base64").toString("utf8");
-      let fixedContent = postProcessCode(
-        await fixFileWithAI(groq, file.filename, original, feedback)
-      );
+      const original     = Buffer.from(fileData.content, "base64").toString("utf8");
+      let   fixedContent = postProcessCode(await fixFileWithAI(groq, file.filename, original, feedback));
 
       if (!fixedContent || fixedContent === original) {
-        console.log(`    No changes needed for ${file.filename}`);
+        console.log(`    No changes for ${file.filename}`);
         continue;
       }
 
       let check = validateSyntax(fixedContent, file.filename);
       if (!check.valid) {
-        console.log(`    ↻ Syntax error — retrying with error feedback...`);
-        fixedContent = postProcessCode(
-          await fixFileWithAI(groq, file.filename, original, feedback, check.error)
-        );
+        console.log(`    ↻ Syntax error — retrying...`);
+        fixedContent = postProcessCode(await fixFileWithAI(groq, file.filename, original, feedback, check.error));
         check = validateSyntax(fixedContent, file.filename);
       }
 
       if (!check.valid) {
-        console.error(`    ✗ Syntax still invalid after retry: ${check.error}`);
+        console.error(`    ✗ Syntax still invalid: ${check.error}`);
         failed.push({ file: file.filename, error: `Syntax check failed after retry: ${check.error}` });
         continue;
       }
-      if (!check.skipped) console.log(`    ✓ Syntax check passed`);
+      if (!check.skipped) console.log(`    ✓ Syntax OK`);
 
-      // Commit to the new fix branch
       await octokit.rest.repos.createOrUpdateFileContents({
         owner, repo,
         path: file.filename,
-        message: `fix(ai): auto-fix security issues in ${file.filename}`,
+        message: `fix(ai): auto-fix issues in ${file.filename}`,
         content: Buffer.from(fixedContent).toString("base64"),
         sha: fileData.sha,
         branch: fixBranch,
       });
 
       fixed.push(file.filename);
-      console.log(`    ✅ Committed to ${fixBranch}`);
+      console.log(`    ✅ Committed`);
     } catch (err) {
       console.error(`    ✗ Failed: ${err.message}`);
       failed.push({ file: file.filename, error: err.message });
@@ -431,13 +484,12 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
     return;
   }
 
-  // Open a new PR with the fixes
   const fixPrBody = [
     `## 🤖 AI Fix for #${prNumber}`,
     "",
     `Auto-applied fixes based on the AI review of PR #${prNumber}.`,
     "",
-    `**Fixed files:**`,
+    "**Fixed:**",
     ...fixed.map((f) => `- ✅ \`${f}\``),
     ...(failed.length > 0 ? ["", "**Could not fix (manual action needed):**", ...failed.map(({ file, error }) => `- ❌ \`${file}\` — ${error}`)] : []),
     "",
@@ -452,13 +504,12 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
     base: baseBranch,
   });
 
-  // Comment on original PR linking to the fix PR
   await octokit.rest.issues.createComment({
     owner, repo, issue_number: prNumber,
-    body: `## 🤖 AI Fix Ready\n\nI've created a new PR with the fixes: **${fixPr.html_url}**\n\nReview and merge it when ready.`,
+    body: `## 🤖 AI Fix Ready\n\nCreated fix PR: **${fixPr.html_url}**\n\nReview and merge when ready.`,
   });
 
-  console.log(`\n✅  Fix PR created: ${fixPr.html_url}`);
+  console.log(`\n✅  Fix PR: ${fixPr.html_url}`);
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -480,7 +531,7 @@ async function main() {
     const prNumber  = event.issue?.number;
     const commentId = event.comment?.id;
     if (!prNumber) throw new Error("Could not determine PR number from event payload.");
-    console.log(`\n🔧  Fixing issues on PR #${prNumber} in ${owner}/${repo}\n`);
+    console.log(`\n🔧  Fixing PR #${prNumber} in ${owner}/${repo}\n`);
     await runFix(octokit, groq, { owner, repo, prNumber, commentId });
   } else {
     const prNumber = event.pull_request?.number;

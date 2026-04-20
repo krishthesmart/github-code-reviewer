@@ -286,40 +286,59 @@ Return ONLY the complete fixed file content. No explanations, no markdown code f
 }
 
 async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
-  // Acknowledge with rocket reaction
   try {
     await octokit.rest.reactions.createForIssueComment({
       owner, repo, comment_id: commentId, content: "rocket",
     });
   } catch (_) {}
 
-  // Get PR branch + latest commit sha
   const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
-  const branch    = pr.head.ref;
-  const commitSha = pr.head.sha;
+  const commitSha  = pr.head.sha;
+  const baseBranch = pr.head.ref;
 
-  // Get changed files
-  const { data: files } = await octokit.rest.pulls.listFiles({
-    owner, repo, pull_number: prNumber, per_page: 100,
-  });
-
-  // Find the latest AI review comment
   const { data: reviews } = await octokit.rest.pulls.listReviews({ owner, repo, pull_number: prNumber });
   const botReview = [...reviews].reverse().find((r) => r.body?.includes("🤖 AI Code Review"));
 
   if (!botReview) {
     await octokit.rest.issues.createComment({
       owner, repo, issue_number: prNumber,
-      body: "## 🤖 AI Fix\n\nNo AI review found on this PR. Open a review first by pushing a commit.",
+      body: "## 🤖 AI Fix\n\nNo AI review found on this PR. Push a commit to trigger a review first.",
     });
     return;
+  }
+
+  const { data: files } = await octokit.rest.pulls.listFiles({
+    owner, repo, pull_number: prNumber, per_page: 100,
+  });
+
+  // Create new fix branch from the PR head
+  const fixBranch = `ai-fix/pr-${prNumber}`;
+  try {
+    await octokit.rest.git.createRef({
+      owner, repo,
+      ref: `refs/heads/${fixBranch}`,
+      sha: commitSha,
+    });
+    console.log(`  → Created branch: ${fixBranch}`);
+  } catch (err) {
+    if (err.status === 422) {
+      // Branch already exists — update it to point to current head
+      await octokit.rest.git.updateRef({
+        owner, repo,
+        ref: `heads/${fixBranch}`,
+        sha: commitSha,
+        force: true,
+      });
+      console.log(`  → Reset existing branch: ${fixBranch}`);
+    } else {
+      throw err;
+    }
   }
 
   const fixed = [];
   const failed = [];
 
   for (const file of files.filter((f) => !shouldSkip(f))) {
-    // Extract this file's feedback from the review body
     const regex = new RegExp(
       `### [✅❌💬] \`${escapeRegex(file.filename)}\`([\\s\\S]*?)(?=###\\s|<sub>|$)`
     );
@@ -331,12 +350,11 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
     console.log(`  → Fixing: ${file.filename}`);
 
     try {
-      // Fetch full file content at PR head
       const { data: fileData } = await octokit.rest.repos.getContent({
         owner, repo, path: file.filename, ref: commitSha,
       });
 
-      const original = Buffer.from(fileData.content, "base64").toString("utf8");
+      const original    = Buffer.from(fileData.content, "base64").toString("utf8");
       const fixedContent = await fixFileWithAI(groq, file.filename, original, feedback);
 
       if (!fixedContent || fixedContent === original) {
@@ -344,58 +362,68 @@ async function runFix(octokit, groq, { owner, repo, prNumber, commentId }) {
         continue;
       }
 
-      // Validate syntax before committing
       const check = validateSyntax(fixedContent, file.filename);
       if (!check.valid) {
-        console.error(`    ✗ Syntax check failed for ${file.filename}: ${check.error}`);
-        failed.push({ file: file.filename, error: `Syntax check failed — fix skipped to avoid breaking your code. Error: ${check.error}` });
+        console.error(`    ✗ Syntax check failed: ${check.error}`);
+        failed.push({ file: file.filename, error: `Syntax check failed: ${check.error}` });
         continue;
       }
-      if (!check.skipped) {
-        console.log(`    ✓ Syntax check passed for ${file.filename}`);
-      }
+      if (!check.skipped) console.log(`    ✓ Syntax check passed`);
 
-      // Commit the fixed file directly to the PR branch
+      // Commit to the new fix branch
       await octokit.rest.repos.createOrUpdateFileContents({
         owner, repo,
         path: file.filename,
         message: `fix(ai): auto-fix security issues in ${file.filename}`,
         content: Buffer.from(fixedContent).toString("base64"),
         sha: fileData.sha,
-        branch,
+        branch: fixBranch,
       });
 
       fixed.push(file.filename);
-      console.log(`    ✅ Fixed and committed: ${file.filename}`);
+      console.log(`    ✅ Committed to ${fixBranch}`);
     } catch (err) {
-      console.error(`    ✗ Failed to fix ${file.filename}: ${err.message}`);
+      console.error(`    ✗ Failed: ${err.message}`);
       failed.push({ file: file.filename, error: err.message });
     }
   }
 
-  // Post summary comment
-  const lines = ["## 🤖 AI Fix Applied", ""];
-
-  if (fixed.length > 0) {
-    lines.push(`Fixed and committed **${fixed.length}** file(s):`);
-    fixed.forEach((f) => lines.push(`- ✅ \`${f}\``));
-    lines.push("");
-    lines.push("> Review the committed changes above before merging.");
-  } else {
-    lines.push("No files were changed — issues may require manual fixes (e.g. moving secrets to env vars).");
+  if (fixed.length === 0) {
+    await octokit.rest.issues.createComment({
+      owner, repo, issue_number: prNumber,
+      body: `## 🤖 AI Fix\n\nNo files could be fixed automatically.\n\n${failed.map(({ file, error }) => `- ❌ \`${file}\` — ${error}`).join("\n")}`,
+    });
+    return;
   }
 
-  if (failed.length > 0) {
-    lines.push("");
-    lines.push("Failed to fix:");
-    failed.forEach(({ file, error }) => lines.push(`- ❌ \`${file}\` — ${error}`));
-  }
+  // Open a new PR with the fixes
+  const fixPrBody = [
+    `## 🤖 AI Fix for #${prNumber}`,
+    "",
+    `Auto-applied fixes based on the AI review of PR #${prNumber}.`,
+    "",
+    `**Fixed files:**`,
+    ...fixed.map((f) => `- ✅ \`${f}\``),
+    ...(failed.length > 0 ? ["", "**Could not fix (manual action needed):**", ...failed.map(({ file, error }) => `- ❌ \`${file}\` — ${error}`)] : []),
+    "",
+    "> Review these changes carefully before merging.",
+  ].join("\n");
 
-  await octokit.rest.issues.createComment({
-    owner, repo, issue_number: prNumber, body: lines.join("\n"),
+  const { data: fixPr } = await octokit.rest.pulls.create({
+    owner, repo,
+    title: `🤖 AI Fix: auto-fix issues from PR #${prNumber}`,
+    body: fixPrBody,
+    head: fixBranch,
+    base: baseBranch,
   });
 
-  console.log(`\n✅  Fix complete. ${fixed.length} file(s) updated.`);
+  // Comment on original PR linking to the fix PR
+  await octokit.rest.issues.createComment({
+    owner, repo, issue_number: prNumber,
+    body: `## 🤖 AI Fix Ready\n\nI've created a new PR with the fixes: **${fixPr.html_url}**\n\nReview and merge it when ready.`,
+  });
+
+  console.log(`\n✅  Fix PR created: ${fixPr.html_url}`);
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ const helmet = require("helmet");
 const dotenv = require("dotenv");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 
 dotenv.config();
 
@@ -33,12 +34,23 @@ async function connectToDatabase() {
   }
 }
 
-const db = connectToDatabase();
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+});
+
+app.use(limiter);
+
+const db = await connectToDatabase();
 
 app.get("/user", async (req, res) => {
   try {
     const id = req.query.id;
-    const [results] = await (await db).execute("SELECT * FROM users WHERE id = ?", [id]);
+    if (!id || isNaN(id) || id <= 0) {
+      res.status(400).send("Invalid user ID");
+      return;
+    }
+    const [results] = await db.execute("SELECT * FROM users WHERE id = ?", [id]);
     res.json(results);
   } catch (error) {
     console.error("Error fetching user:", error);
@@ -54,7 +66,7 @@ app.get("/greet", (req, res) => {
 
 app.delete("/admin/delete-all", authenticateAdmin, async (req, res) => {
   try {
-    await (await db).execute("DELETE FROM users");
+    await db.execute("DELETE FROM users");
     res.send("All users deleted");
   } catch (error) {
     console.error("Error deleting users:", error);
@@ -65,7 +77,7 @@ app.delete("/admin/delete-all", authenticateAdmin, async (req, res) => {
 app.post("/login", async (req, res) => {
   try {
     const { username, password } = req.body;
-    const [user] = await (await db).execute("SELECT * FROM users WHERE username = ?", [username]);
+    const [user] = await db.execute("SELECT * FROM users WHERE username = ?", [username]);
     if (!user) {
       res.status(401).send("Invalid username or password");
       return;
@@ -86,19 +98,29 @@ app.post("/login", async (req, res) => {
 function authenticateAdmin(req, res, next) {
   const token = req.header("Authorization");
   if (!token) {
-    res.status(401).send("Unauthorized");
+    res.status(401).send("Unauthorized: missing token");
     return;
   }
   try {
     const decoded = jwt.verify(token, process.env.SECRET_KEY);
+    if (decoded.exp < Date.now() / 1000) {
+      res.status(401).send("Unauthorized: token expired");
+      return;
+    }
     if (decoded.userId !== 1) {
-      res.status(403).send("Forbidden");
+      res.status(403).send("Forbidden: not an admin");
       return;
     }
     next();
   } catch (error) {
-    console.error("Error authenticating admin:", error);
-    res.status(401).send("Unauthorized");
+    if (error.name === "TokenExpiredError") {
+      res.status(401).send("Unauthorized: token expired");
+    } else if (error.name === "JsonWebTokenError") {
+      res.status(401).send("Unauthorized: invalid token");
+    } else {
+      console.error("Error authenticating admin:", error);
+      res.status(500).send("Internal Server Error");
+    }
   }
 }
 

@@ -40815,12 +40815,19 @@ const SEVERITY_EMOJI = {
   SUGGESTION: "💡",
 };
 
-const REVIEW_SYSTEM_PROMPT = `You are a senior security-focused code reviewer. Analyze the provided diff.
+const REVIEW_SYSTEM_PROMPT = `You are a senior code reviewer. Analyze the provided diff across ALL five categories.
 
 Respond with ONLY valid JSON in this exact format (no other text):
 {
   "verdict": "REQUEST_CHANGES",
-  "summary": "One paragraph overall assessment.",
+  "summary": "One paragraph overall assessment of the change.",
+  "sections": {
+    "Security": "Assessment of security issues found or confirmed clean. Mention what was checked.",
+    "Bugs": "Assessment of bugs, logic errors, edge cases, or null dereferences found or confirmed clean.",
+    "Performance": "Assessment of performance bottlenecks, N+1 queries, or inefficiencies found or confirmed clean.",
+    "Maintainability": "Assessment of code readability, duplication, naming, complexity found or confirmed clean.",
+    "Best Practices": "Assessment of coding standards, error handling, test coverage, patterns found or confirmed clean."
+  },
   "issues": [
     {
       "line": 42,
@@ -40838,22 +40845,18 @@ verdict rules:
 - "COMMENT" for minor/suggestion-only issues
 
 severity values: CRITICAL, HIGH, MEDIUM, LOW, SUGGESTION
-category values: Security, Bug, Performance, Maintainability
+category values: Security, Bug, Performance, Maintainability, Best Practices
 
 line: the line number in the NEW file where the issue appears (from the + lines in the diff).
       Use null if the issue is not tied to a specific line.
 
-Security checks (OWASP Top 10 + more):
-- SQL/Command/LDAP injection, XSS, SSRF, path traversal, XXE
-- Broken auth, insecure tokens, weak passwords
-- Hardcoded secrets, API keys, PII in logs
-- Broken access control, missing auth checks
-- Security misconfiguration, verbose errors
-- Known vulnerable dependencies
+Security (OWASP Top 10): SQL/command injection, XSS, SSRF, broken auth, hardcoded secrets, missing access control.
+Bugs: null dereference, race conditions, off-by-one, unhandled exceptions, wrong logic.
+Performance: N+1 queries, missing indexes, blocking calls, large loops, memory leaks.
+Maintainability: long functions, duplication, unclear naming, tight coupling, missing comments on complex logic.
+Best Practices: error handling, input validation, test coverage, use of deprecated APIs, consistent style.
 
-Also check: bugs, logic errors, null dereference, race conditions, memory leaks,
-unhandled exceptions, performance issues, dead code, missing input validation.
-
+IMPORTANT: You MUST populate all five sections even if a category is clean — write what you checked and the outcome.
 Return ONLY the JSON. No markdown fences, no explanation outside the JSON.`;
 
 const MAX_DIFF_CHARS = 15_000;
@@ -41028,21 +41031,22 @@ async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
 
       if (!parsed) {
         console.warn(`    Could not parse JSON response for ${file.filename}`);
-        results.push({ filename: file.filename, verdict: "COMMENT", issues: [], summary: raw, error: null });
+        results.push({ filename: file.filename, verdict: "COMMENT", issues: [], summary: raw, sections: {}, error: null });
         continue;
       }
 
       results.push({
         filename: file.filename,
-        verdict:  parsed.verdict || "COMMENT",
-        issues:   parsed.issues  || [],
-        summary:  parsed.summary || "",
+        verdict:  parsed.verdict  || "COMMENT",
+        issues:   parsed.issues   || [],
+        summary:  parsed.summary  || "",
+        sections: parsed.sections || {},
         error:    null,
       });
       console.log(`    Verdict: ${parsed.verdict} — ${parsed.issues?.length ?? 0} issue(s)`);
     } catch (err) {
       console.error(`  ✗ Error: ${err.message}`);
-      results.push({ filename: file.filename, verdict: "COMMENT", issues: [], summary: null, error: err.message });
+      results.push({ filename: file.filename, verdict: "COMMENT", issues: [], summary: null, sections: {}, error: err.message });
     }
   }
 
@@ -41065,13 +41069,22 @@ async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
   }
 
   // ── Build summary review body ────────────────────────────────────────────
+  const SECTION_ICONS = {
+    Security:        "🔒",
+    Bugs:            "🐛",
+    Performance:     "⚡",
+    Maintainability: "🧹",
+    "Best Practices":"📐",
+  };
+  const SECTION_ORDER = ["Security", "Bugs", "Performance", "Maintainability", "Best Practices"];
+
   const allIssues = results.flatMap((r) => r.issues);
   const counts    = countBySeverity(allIssues);
 
   const summaryLines = [
     `## 🤖 AI Code Review — ${verdictEmoji(finalVerdict)}`,
     "",
-    `> Powered by **Groq** (\`${GROQ_MODEL}\`) · Checks: Security · Bugs · Performance · Maintainability`,
+    `> Powered by **Groq** (\`${GROQ_MODEL}\`) · Checks: Security · Bugs · Performance · Maintainability · Best Practices`,
     `> 💡 Comment \`/fix\` to auto-apply fixes · \`/review\` to re-run review`,
     "",
   ];
@@ -41086,22 +41099,34 @@ async function runReview(octokit, groq, { owner, repo, prNumber, commitId }) {
 
   summaryLines.push("---", "");
 
-  for (const { filename, issues, summary, error } of results) {
+  for (const { filename, issues, summary, sections, error } of results) {
     const icon = issues.some((i) => ["CRITICAL","HIGH"].includes(i.severity)) ? "❌"
                : issues.length === 0 ? "✅" : "💬";
     summaryLines.push(`### ${icon} \`${filename}\``);
     summaryLines.push("");
+
     if (error) {
       summaryLines.push(`> ⚠️ Review skipped — API error: ${error}`);
-    } else if (issues.length === 0) {
-      summaryLines.push(summary || "No issues found. Looks good! ✅");
     } else {
       if (summary) summaryLines.push(`> ${summary}`, "");
-      for (const issue of issues) {
-        const emoji = SEVERITY_EMOJI[issue.severity] ?? "•";
-        summaryLines.push(`**${emoji} ${issue.severity} ${issue.category} — ${issue.title}**`);
-        summaryLines.push(issue.body);
-        summaryLines.push("");
+
+      // Render all 5 category sections
+      for (const section of SECTION_ORDER) {
+        const sectionIcon = SECTION_ICONS[section];
+        const sectionIssues = issues.filter((i) => i.category === section || i.category === section.replace("Bugs","Bug"));
+        const sectionSummary = sections[section] || "";
+        const hasProblems = sectionIssues.some((i) => ["CRITICAL","HIGH","MEDIUM"].includes(i.severity));
+        const statusIcon = sectionIssues.length === 0 ? "✅" : hasProblems ? "❌" : "💡";
+
+        summaryLines.push(`#### ${sectionIcon} ${section} ${statusIcon}`);
+        if (sectionSummary) summaryLines.push(sectionSummary, "");
+
+        for (const issue of sectionIssues) {
+          const emoji = SEVERITY_EMOJI[issue.severity] ?? "•";
+          summaryLines.push(`**${emoji} ${issue.severity} — ${issue.title}**`);
+          summaryLines.push(issue.body);
+          summaryLines.push("");
+        }
       }
     }
     summaryLines.push("---", "");

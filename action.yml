@@ -1,5 +1,5 @@
-name: AI Code Reviewer
-description: Automatically reviews pull requests using Groq AI (llama-3.3-70b-versatile)
+name: Groq AI Code Reviewer
+description: Autonomous PR reviewer using Groq AI — Security, Bugs, Performance, Maintainability, Best Practices with auto-fix
 author: krishthesmart
 
 inputs:
